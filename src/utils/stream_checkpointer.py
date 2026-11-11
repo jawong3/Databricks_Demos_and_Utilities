@@ -4,6 +4,7 @@ The script contains ...
 import shutil
 import functools
 import uuid
+from pyspark.sql import DataFrame
 
 
 class TempCheckpointDisplay:
@@ -56,4 +57,16 @@ class TempCheckpointDisplay:
             print(f"[tckp_display] removed {path}")
         except Exception as e:
             print(f"[tckp_display] could not remove {path}: {e}")
+
+
+def register_tckp_display(display, base_path):
+    """Create a TempCheckpointDisplay and attach it to DataFrame,
+    so both tckp_display(df) and df.tckp_display() work."""
+    tckp = TempCheckpointDisplay(display, base_path)
+
+    def _method(self, **kwargs):
+        return tckp(self, **kwargs)
+
+    DataFrame.tckp_display = _method
+    return tckp
 
