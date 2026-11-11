@@ -1,23 +1,31 @@
 """
-Generic benchmarking helpers for plain Python functions and Spark transformations.
- 
-- time_runs:        wall-clock timing over repeated runs. Spark DataFrames returned by the
-                    function are forced to execute with a noop write, so lazy evaluation
-                    (or shortcuts like count()/collect()) can't skew the result.
-- track_stages:     records the Spark stages, and their task counts, launched by each call.
-- track_partitions: records the number of partitions and empty partitions in the Spark
-                    DataFrame returned by the function.
+This script holds benchmarking decorators catered towards Spark DataFrames & Transformations,
+however they can also be used for plain Python functions. These decorators are designed to be
+stackable with eachother, however the order in which they are invoked matters.
 
-Functions are designed to be stackable decorators, however the order matters:
-    @track_partitions
-    @time_runs
-    @track_stages
+Below are all the decorators available in order of which they should be stacked
+along with a short description of their functionality:
+
+    - track_partitions
+        records the number of partitions and empty partitions in the
+        Spark DataFrame returned by the function.
+    - time_runs
+        wall-clock timing over repeated runs. Spark DataFrames returned by the
+        function are forced to execute with a noop write, so lazy evaluation
+        (or shortcuts like count()/collect()) can't skew the result.
+    - track_stages
+        records the Spark stages, and their task counts, launched by each call.
+
 """
 import time
 from functools import wraps
 from typing import Any
 
+
 def _isSparkDF(x) -> bool:
+    """
+    Check if the parameter object provided is a Spark DataFrame
+    """
     try:
         from pyspark.sql.connect.dataframe import DataFrame as ConnectDF
         if isinstance(x, ConnectDF): return True

@@ -1,22 +1,24 @@
 """
-delta_tree.py - print a directory tree of a Delta table's parquet files.
+This script holds an implementation to visualize the file directory of Delta tables.
+Users can call show_delta_tree() and provide at minimum the unity catalog path
+(either absolute or relative) to the table. The following information will get
+return:
 
-Usage in a Databricks notebook:
+    HEADER:
+        List information such as the table name, location, size, partitioning and
+        clustering strategries.
 
-    %run ./delta_tree        # or: from delta_tree import show_delta_tree
+    TREE:
+        A visual tree of the table's directory structure, including the number of
+        active and tombstoned files, the number of rows, and the size of each
+        file.
 
-    show_delta_tree("main.default.events")
-    show_delta_tree("main.default.events", row_groups=True)   # + intra-file stats
+    STATISTICS:
+        Calculations of the distribution of variables within each partition
 
-What you get:
-  * the file layout (partition dirs -> parquet files) with rows / size per file
-  * files from earlier table versions that are no longer in the latest one
-    (found via time travel) crossed out
-  * inter-file stats: per-file min/max computed from the data, plus an overlap
-    summary and a range chart per column of the active files (how well can
-    data skipping prune?)
-  * intra-file stats (optional, row_groups=True): row-group row counts and
-    min/max from the parquet footers
+    CHARTS:
+        Visual chart of the distribution of variables within each partition
+        
 """
 import json
 import re
@@ -26,19 +28,20 @@ from urllib.parse import unquote
 _NUMERIC = {"tinyint", "smallint", "int", "bigint", "float", "double", "decimal"}
 _STRIKE = "\u0336"
 
-
 # --------------------------------------------------------------------------- #
-# Collecting (needs Spark)
+# Data Extraction (Spark Required)
 # --------------------------------------------------------------------------- #
 def _row_groups(spark, full_path, cols):
-    """Row-group row counts and min/max for `cols`, read from the parquet footer
-    through the JVM (needs a cluster where spark._jvm is reachable)."""
+    """
+    Grab row group statistics for `cols` from the parquet footers via JVM
+    """
     jvm = spark._jvm
     conf = spark._jsc.hadoopConfiguration()
     inp = jvm.org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(
         jvm.org.apache.hadoop.fs.Path(full_path), conf
     )
     reader = jvm.org.apache.parquet.hadoop.ParquetFileReader.open(inp)
+
     try:
         out = []
         for b in reader.getFooter().getBlocks():
@@ -53,7 +56,7 @@ def _row_groups(spark, full_path, cols):
                 vals = []
                 for v in (st.genericGetMin(), st.genericGetMax()):
                     try:
-                        v = v.toStringUsingUTF8()  # Binary (strings)
+                        v = v.toStringUsingUTF8()
                     except Exception:
                         pass
                     vals.append(v)
@@ -181,7 +184,7 @@ def collect_delta_files(spark, table, back=1, versions=None):
 
 
 # --------------------------------------------------------------------------- #
-# Rendering (pure python)
+# Rendering (Pure python)
 # --------------------------------------------------------------------------- #
 def _strike(s):
     return "".join(ch + _STRIKE for ch in s)
@@ -405,7 +408,7 @@ def render_tree(files, meta, show_tombstones=True, full_names=False,
 
 
 # --------------------------------------------------------------------------- #
-# Entry point
+# Entry Point
 # --------------------------------------------------------------------------- #
 def show_delta_tree(table, row_groups=False, show_tombstones=True, full_names=False,
                     max_files=300, chart_cols=2, max_overlap_frac=0.6, back=1,
