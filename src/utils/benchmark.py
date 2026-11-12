@@ -13,6 +13,8 @@ along with a short description of their functionality:
         wall-clock timing over repeated runs. Spark DataFrames returned by the
         function are forced to execute with a noop write, so lazy evaluation
         (or shortcuts like count()/collect()) can't skew the result.
+    - clear_cache
+        clear Spark's in-memory cache prior and after each call.
     - track_stages
         records the Spark stages, and their task counts, launched by each call.
 
@@ -158,4 +160,28 @@ def track_partitions(fn):
  
     wrapper.partitions = counts
     return wrapper
+
+
+def clear_cache(func=None, *, before: bool = True, after: bool = False):
+    """
+    Clear Spark's in-memory cache around a call
+    """
+ 
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            spark = _get_spark()
+            if before:
+                spark.catalog.clearCache()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if after:
+                    spark.catalog.clearCache()
+ 
+        return wrapper
+ 
+    if callable(func):
+        return decorator(func)
+    return decorator
 
