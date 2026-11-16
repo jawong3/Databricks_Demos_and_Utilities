@@ -63,10 +63,11 @@ def time_runs(*, runs: int = 5, label: str = ""):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             # Start each call fresh: clear any per-run records (e.g. track_stages)
-            stages = getattr(fn, "stages", [])
-            if len(stages):
-                stages = []
-            
+            # (clear in place: rebinding a local name would leave `fn.stages` untouched)
+            stages = getattr(fn, "stages", None)
+            if stages is not None:
+                stages.clear()
+
             times: list[float] = []
             for _ in range(runs):
                 start = time.perf_counter()
@@ -94,8 +95,10 @@ def track_stages(fn):
         {"job": x_0, "stage": y_0, "tasks": z_0, "name": w_0},
         ...
         {"job": x_n, "stage": y_n, "tasks": z_n, "name": w_n},
-        {"total_task_count": int}
+        {"task_chain": "200 -> 8 -> 8 (Total of 216)"}
     ]
+
+    The chain lists each stage's task count in stage order, followed by their sum.
 
     """
     stages_per_call: list[list[dict[str, Any]]] = []
@@ -125,8 +128,11 @@ def track_stages(fn):
                 if info is not None:
                     stages.append({"job": j, "stage": s, "tasks": info.numTasks, "name": info.name})
  
-        # Calculate the total number of task created
-        stages.append({"total_task_count": sum(s["tasks"] for s in stages)})
+        # Chain of task counts in execution order
+        stages.sort(key=lambda s: s["stage"])
+        counts = [s["tasks"] for s in stages]
+        chain = " -> ".join(str(c) for c in counts)
+        stages.append({"task_chain": f"{chain} (Total of {sum(counts)})"})
         stages_per_call.append(stages)
         return result
  
@@ -168,9 +174,11 @@ def clear_cache(func=None, *, before: bool = True, after: bool = False):
     """
  
     def decorator(fn):
-        @functools.wraps(fn)
+        @wraps(fn)
         def wrapper(*args, **kwargs):
-            spark = _get_spark()
+            from pyspark.sql import SparkSession
+
+            spark = SparkSession.builder.getOrCreate()
             if before:
                 spark.catalog.clearCache()
             try:
@@ -184,4 +192,3 @@ def clear_cache(func=None, *, before: bool = True, after: bool = False):
     if callable(func):
         return decorator(func)
     return decorator
-
