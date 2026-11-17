@@ -5,14 +5,15 @@ import shutil
 import functools
 import uuid
 import pandas as pd
+import json
 import re
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from typing import NamedTuple, Optional, Sequence, Tuple
 
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as f
-from pyspark.sql.streaming import StatefulProcessor
-
+from pyspark.sql.streaming import StatefulProcessor, StreamingQueryListener
+from pyspark.sql.types import ArrayType, LongType, MapType, StringType, StructType, TimestampType
 
 # --------------------------------------------------------
 # Private Helper Functions & Variables
@@ -66,6 +67,17 @@ def _as_tuple(x):
     return (x,) if isinstance(x, (str, Column)) else tuple(x)
 
 
+def _ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
+
+
+def _int(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+    
+
 class AggSpec(NamedTuple):
     kind: str            # sum | count | min | max
     col: Optional[str]   # None => count every row (count("*") / count(lit(1)))
@@ -90,6 +102,28 @@ def _parse_agg(c: Column, out_name: str, ddl_type: str) -> AggSpec:
     if not re.fullmatch(r"[\w.\- ]+", arg):
         raise ValueError(f"Aggregation input must be a plain column (got {arg!r} in {c!r})")
     return AggSpec(kind, arg, out_name, ddl_type)
+
+
+LIFECYCLE_SCHEMA = (StructType()
+    .add("event_type", StringType())
+    .add("query_id", StringType())
+    .add("run_id", StringType())
+    .add("query_name", StringType())
+    .add("event_time", TimestampType())
+    .add("error", StringType()))
+
+
+PROGRESS_SCHEMA = (StructType()
+    .add("query_id", StringType())
+    .add("query_name", StringType())
+    .add("batch_id", LongType())
+    .add("batch_timestamp", TimestampType())
+    .add("batch_duration", LongType())
+    .add("duration_breakdown", MapType(StringType(), LongType()))
+    .add("input_rows", LongType())
+    .add("sources", ArrayType(StringType()))
+    .add("files_outstanding", ArrayType(LongType()))
+    .add("bytes_outstanding", ArrayType(LongType())))
 
 
 # --------------------------------------------------------
@@ -345,3 +379,112 @@ def register_tckp_display(display, base_path):
     DataFrame.tckp_display = _method
     return tckp
 
+
+# --------------------------------------------------------
+# Table Logging Streaming Query Listener
+# --------------------------------------------------------
+class TableStreamingQueryListener(StreamingQueryListener):
+    def __init__(self, spark, lifecycle_table, progress_table, skip_empty_batches=True):
+        super().__init__()
+        self.spark = spark
+        self.lifecycle_table = lifecycle_table
+        self.progress_table = progress_table
+        self.skip_empty_batches = skip_empty_batches
+
+        # Points Table UUIDs to their catalog.schema.table counterparts
+        self._table_names = {}
+
+        # Keep track of active stream query names
+        self._query_names = {str(q.id): q.name for q in spark.streams.active}
+
+        # Create tables if missing
+        for table, schema in [(lifecycle_table, LIFECYCLE_SCHEMA), (progress_table, PROGRESS_SCHEMA)]:
+            if table is not None:
+                spark.createDataFrame([], schema).write.mode("ignore").saveAsTable(table)
+
+    def _log(self, table, schema, row):
+        self.spark.createDataFrame([row], schema).write.mode("append").saveAsTable(table)
+
+    def _delta_name(self, uuid):
+        if uuid not in self._table_names:
+            row = self.spark.sql(f"""
+                SELECT concat_ws('.', table_catalog, table_schema, table_name) AS name
+                FROM system.information_schema.tables
+                WHERE storage_path LIKE '%/tables/{uuid}'""").first()
+            self._table_names[uuid] = row["name"] if row else None
+        return self._table_names[uuid]
+
+    def _source_name(self, source):
+        """
+        Grabs the header found in the source's description.
+        If its a managed table, grab the unity catalog path 'catalog.schema.table' instead
+        """
+        desc = source.get("description", "")
+        kind = re.match(r"[^\[]*", desc)[0]
+        match = re.search(r"/tables/([0-9a-f-]{36})", desc)
+
+        if kind != "DeltaSource" or not match:
+            return kind
+        try:
+            return self._delta_name(match[1]) or kind
+        except Exception:
+            return kind
+
+    def onQueryStarted(self, event):
+        self._query_names[str(event.id)] = event.name
+
+        # Skip logging if table is not defined
+        if self.lifecycle_table is None: return
+
+        self._log(self.lifecycle_table, LIFECYCLE_SCHEMA,
+            dict(
+                event_type  = "STARTED",
+                query_id    = str(event.id),
+                run_id      = str(event.runId),
+                query_name  = event.name,
+                event_time  = _ts(event.timestamp)
+            ))
+
+    def onQueryTerminated(self, event):
+        query_id = str(event.id)
+        query_name = self._query_names.pop(query_id, None)
+
+        # Skip logging if table is not defined
+        if self.lifecycle_table is None: return
+
+        self._log(self.lifecycle_table, LIFECYCLE_SCHEMA,
+            dict(
+                event_type  = "TERMINATED",
+                query_id    = str(event.id),
+                run_id      = str(event.runId),
+                query_name  = query_name,
+                event_time  = datetime.now(timezone.utc),
+                error       = event.exception
+            ))
+
+    def onQueryIdle(self, event):
+        pass
+
+    def onQueryProgress(self, event):
+        p = json.loads(event.progress.json)
+
+        if self.skip_empty_batches and not p.get("numInputRows"):
+            return
+        
+        sources = p.get("sources") or []
+        metric = lambda k: [_int((s.get("metrics") or {}).get(k)) for s in sources]
+
+        self._log(self.progress_table, PROGRESS_SCHEMA,
+            dict(
+                query_id            = p.get("id"),
+                query_name          = p.get("name"),
+                batch_id            = p.get("batchId"),
+                batch_timestamp     = _ts(p.get("timestamp")),
+                batch_duration      = p.get("batchDuration"),
+                duration_breakdown  = p.get("durationMs"),
+                input_rows          = p.get("numInputRows"),
+                sources             = [self._source_name(s) for s in sources],
+                files_outstanding   = metric("numFilesOutstanding"),
+                bytes_outstanding   = metric("numBytesOutstanding")
+            ))
+        
