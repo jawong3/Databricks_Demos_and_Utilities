@@ -6,6 +6,9 @@ import functools
 import uuid
 import pandas as pd
 import json
+import queue
+from collections import deque
+import threading
 import re
 from datetime import timedelta, datetime, timezone
 from typing import NamedTuple, Optional, Sequence, Tuple
@@ -13,7 +16,7 @@ from typing import NamedTuple, Optional, Sequence, Tuple
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as f
 from pyspark.sql.streaming import StatefulProcessor, StreamingQueryListener
-from pyspark.sql.types import ArrayType, LongType, MapType, StringType, StructType, TimestampType
+from pyspark.sql.types import *
 
 # --------------------------------------------------------
 # Private Helper Functions & Variables
@@ -386,28 +389,27 @@ def register_tckp_display(display, base_path):
 class TableStreamingQueryListener(StreamingQueryListener):
     def __init__(self, spark, lifecycle_table, progress_table, skip_empty_batches=True):
         super().__init__()
-        self.spark = spark
+        self._spark = spark
         self.lifecycle_table = lifecycle_table
         self.progress_table = progress_table
         self.skip_empty_batches = skip_empty_batches
 
-        # Points Table UUIDs to their catalog.schema.table counterparts
         self._table_names = {}
-
-        # Keep track of active stream query names
         self._query_names = {str(q.id): q.name for q in spark.streams.active}
 
-        # Create tables if missing
+        self._queue = queue.Queue()
+        threading.Thread(target=self._drain, daemon=True, name="stream-listener-writer").start()
+
         for table, schema in [(lifecycle_table, LIFECYCLE_SCHEMA), (progress_table, PROGRESS_SCHEMA)]:
             if table is not None:
                 spark.createDataFrame([], schema).write.mode("ignore").saveAsTable(table)
 
     def _log(self, table, schema, row):
-        self.spark.createDataFrame([row], schema).write.mode("append").saveAsTable(table)
+        self._queue.put((table, schema, row))
 
     def _delta_name(self, uuid):
         if uuid not in self._table_names:
-            row = self.spark.sql(f"""
+            row = self._spark.sql(f"""
                 SELECT concat_ws('.', table_catalog, table_schema, table_name) AS name
                 FROM system.information_schema.tables
                 WHERE storage_path LIKE '%/tables/{uuid}'""").first()
@@ -415,10 +417,6 @@ class TableStreamingQueryListener(StreamingQueryListener):
         return self._table_names[uuid]
 
     def _source_name(self, source):
-        """
-        Grabs the header found in the source's description.
-        If its a managed table, grab the unity catalog path 'catalog.schema.table' instead
-        """
         desc = source.get("description", "")
         kind = re.match(r"[^\[]*", desc)[0]
         match = re.search(r"/tables/([0-9a-f-]{36})", desc)
@@ -430,26 +428,47 @@ class TableStreamingQueryListener(StreamingQueryListener):
         except Exception:
             return kind
 
+    def _drain(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                table, schema, row = item
+                row = row() if callable(row) else row
+                self._spark.createDataFrame([row], schema).write.mode("append").saveAsTable(table)
+            finally:
+                self._queue.task_done()
+
+    def flush(self):
+        self._queue.join()
+
+    def close(self):
+        self.flush()
+        self._queue.put(None)
+
+    # TODO: The logic is correct, however the function doesn't fire consistently regardless of its contents
     def onQueryStarted(self, event):
+        pass
         self._query_names[str(event.id)] = event.name
 
-        # Skip logging if table is not defined
-        if self.lifecycle_table is None: return
+        # if self.lifecycle_table is None: return
 
-        self._log(self.lifecycle_table, LIFECYCLE_SCHEMA,
-            dict(
-                event_type  = "STARTED",
-                query_id    = str(event.id),
-                run_id      = str(event.runId),
-                query_name  = event.name,
-                event_time  = _ts(event.timestamp)
-            ))
+        # self._log(self.lifecycle_table, LIFECYCLE_SCHEMA,
+        #     dict(
+        #         event_type  = "STARTED",
+        #         query_id    = str(event.id),
+        #         run_id      = str(event.runId),
+        #         query_name  = event.name,
+        #         event_time  = _ts(event.timestamp)
+        #     ))
 
+    # TODO: Use pop instead once onQueryStarted is fixed
     def onQueryTerminated(self, event):
         query_id = str(event.id)
-        query_name = self._query_names.pop(query_id, None)
+        # query_name = self._query_names.pop(query_id, None)
+        query_name = self._query_names[str(event.id)]
 
-        # Skip logging if table is not defined
         if self.lifecycle_table is None: return
 
         self._log(self.lifecycle_table, LIFECYCLE_SCHEMA,
@@ -462,15 +481,14 @@ class TableStreamingQueryListener(StreamingQueryListener):
                 error       = event.exception
             ))
 
-    def onQueryIdle(self, event):
-        pass
-
     def onQueryProgress(self, event):
         p = json.loads(event.progress.json)
+        if p.get("id") and p.get("name"):
+            self._query_names.setdefault(p["id"], p["name"])
 
         if self.skip_empty_batches and not p.get("numInputRows"):
             return
-        
+
         sources = p.get("sources") or []
         metric = lambda k: [_int((s.get("metrics") or {}).get(k)) for s in sources]
 
@@ -487,4 +505,7 @@ class TableStreamingQueryListener(StreamingQueryListener):
                 files_outstanding   = metric("numFilesOutstanding"),
                 bytes_outstanding   = metric("numBytesOutstanding")
             ))
-        
+
+    def onQueryIdle(self, event):
+        pass
+
