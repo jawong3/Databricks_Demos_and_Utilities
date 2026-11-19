@@ -1,5 +1,19 @@
 """
 The script contains add-on functions to assist the developement of spark strucutre streaming piplines
+
+Below are the functions and classes available to use:
+
+    live_session_window - Instead of how a native session window behalves, sending
+        records into the micro-batch only after the window is closed off and passed it watermark,
+        a live session window will send on-going session windows to the micro-batch, continously
+        updating the event until its closed.
+
+    tckp_display - Displaying a streaming table requires a checkpoint path which cannot be reused.
+        This limitation makes developement tedious. This function creates a temporary checkpoint on the fly
+        behaving as display would on a regular table - without explicitly defining some checkpoint path
+
+    TableStreamingQueryListener - This streaming query listener implementation writes records on a
+        unity catalog table, maintaining full history which opens opportunities to create alerts.
 """
 import shutil
 import functools
