@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbx-utils"
+version = "0.1.0"
+description = "Utility functions for development within the Databricks ecosystem"
+readme = "README.md"
+requires-python = ">=3.10"
+# pyspark and pandas are provided by the Databricks runtime; listing them here
+# could make pip install a second copy over the runtime's own.
+dependencies = []
+
+[tool.setuptools]
+packages = ["dbx_utils"]   # ship only the utilities, not demos/

@@ -1,0 +1,32 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging / build output
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Databricks (CLI / Asset Bundles local state)
+.databricks/
+.databrickscfg
+
+# Secrets / local config
+.env
+.env.*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
