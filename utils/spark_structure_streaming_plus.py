@@ -9,6 +9,7 @@ import json
 import queue
 from collections import deque
 import threading
+import time
 import re
 from datetime import timedelta, datetime, timezone
 from typing import NamedTuple, Optional, Sequence, Tuple
@@ -387,22 +388,54 @@ def register_tckp_display(display, base_path):
 # Table Logging Streaming Query Listener
 # --------------------------------------------------------
 class TableStreamingQueryListener(StreamingQueryListener):
-    def __init__(self, spark, lifecycle_table, progress_table, skip_empty_batches=True):
+    def __init__(self, spark, lifecycle_table, progress_table, skip_empty_batches=True, polling_rate=2):
         super().__init__()
         self._spark = spark
         self.lifecycle_table = lifecycle_table
         self.progress_table = progress_table
         self.skip_empty_batches = skip_empty_batches
+        self.polling_rate = polling_rate
 
         self._table_names = {}
         self._query_names = {str(q.id): q.name for q in spark.streams.active}
 
-        self._queue = queue.Queue()
-        threading.Thread(target=self._drain, daemon=True, name="stream-listener-writer").start()
+        # Last batch id already logged per query, seeded so we don't re-log history.
+        self._last_batch = {}
+        for q in spark.streams.active:
+            p = q.lastProgress
+            self._last_batch[str(q.id)] = p.batchId if p else -1
 
         for table, schema in [(lifecycle_table, LIFECYCLE_SCHEMA), (progress_table, PROGRESS_SCHEMA)]:
             if table is not None:
                 spark.createDataFrame([], schema).write.mode("ignore").saveAsTable(table)
+
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(target=self._drain, daemon=True, name="stream-listener-writer")
+        self._thread.start()
+
+        # Progress poller: replaces onQueryProgress, which is not delivered reliably.
+        self._stop_event = threading.Event()
+        self._poller = threading.Thread(target=self._poll, daemon=True, name="stream-listener-poller")
+        self._poller.start()
+
+    @classmethod
+    def register(cls, spark, *args, **kwargs):
+        """Remove any listener of this class already on the session, then add a fresh one."""
+        for old in cls._registered(spark):
+            spark.streams.removeListener(old)
+            try:
+                old.close(timeout=10)
+            except Exception:
+                pass
+        listener = cls(spark, *args, **kwargs)
+        spark.streams.addListener(listener)
+        return listener
+
+    @classmethod
+    def _registered(cls, spark):
+        # Matches by class name so instances of an older cell-defined version are found too.
+        bus = getattr(getattr(spark.streams, "_sqlb", None), "_listener_bus", None)
+        return [l for l in list(bus or []) if type(l).__name__ == cls.__name__]
 
     def _log(self, table, schema, row):
         self._queue.put((table, schema, row))
@@ -436,76 +469,92 @@ class TableStreamingQueryListener(StreamingQueryListener):
                     return
                 table, schema, row = item
                 row = row() if callable(row) else row
-                self._spark.createDataFrame([row], schema).write.mode("append").saveAsTable(table)
+                self._spark.createDataFrame([row], schema).writeTo(table).append()
             finally:
                 self._queue.task_done()
+
+    def _poll(self):
+        """Poll lastProgress of every active query and log any batch we haven't seen yet."""
+        while not self._stop_event.is_set():
+            for q in self._spark.streams.active:
+                qid = str(q.id)
+                event = q.lastProgress
+                if event is None:
+                    continue
+                if event.batchId > self._last_batch.get(qid, -1):
+                    self.ext_onQueryProgress(event)
+                    self._last_batch[qid] = event.batchId
+
+            # wait() instead of sleep() so close() can interrupt immediately
+            self._stop_event.wait(self.polling_rate)
 
     def flush(self):
         self._queue.join()
 
-    def close(self):
+    def close(self, timeout=None):
+        # Stop the poller first so nothing new is enqueued, then drain and stop the writer.
+        self._stop_event.set()
+        self._poller.join(timeout=timeout)
         self.flush()
         self._queue.put(None)
 
-    # TODO: The logic is correct, however the function doesn't fire consistently regardless of its contents
     def onQueryStarted(self, event):
-        pass
-        self._query_names[str(event.id)] = event.name
+        query_id = str(event.id)
+        self._query_names[query_id] = event.name
 
-        # if self.lifecycle_table is None: return
+        self._log(self.lifecycle_table, LIFECYCLE_SCHEMA,
+            dict(
+                event_type  = "STARTED",
+                query_id    = query_id,
+                run_id      = str(event.runId),
+                query_name  = event.name,
+                event_time  = _ts(event.timestamp),
+                error       = None
+            ))
 
-        # self._log(self.lifecycle_table, LIFECYCLE_SCHEMA,
-        #     dict(
-        #         event_type  = "STARTED",
-        #         query_id    = str(event.id),
-        #         run_id      = str(event.runId),
-        #         query_name  = event.name,
-        #         event_time  = _ts(event.timestamp)
-        #     ))
-
-    # TODO: Use pop instead once onQueryStarted is fixed
     def onQueryTerminated(self, event):
         query_id = str(event.id)
-        # query_name = self._query_names.pop(query_id, None)
-        query_name = self._query_names[str(event.id)]
-
-        if self.lifecycle_table is None: return
 
         self._log(self.lifecycle_table, LIFECYCLE_SCHEMA,
             dict(
                 event_type  = "TERMINATED",
-                query_id    = str(event.id),
+                query_id    = query_id,
                 run_id      = str(event.runId),
-                query_name  = query_name,
+                query_name  = self._query_names.pop(query_id, None),
                 event_time  = datetime.now(timezone.utc),
                 error       = event.exception
             ))
+        self._last_batch.pop(query_id, None)
 
     def onQueryProgress(self, event):
-        p = json.loads(event.progress.json)
-        if p.get("id") and p.get("name"):
-            self._query_names.setdefault(p["id"], p["name"])
+        # Handled by the _poll thread (see ext_onQueryProgress).
+        pass
 
-        if self.skip_empty_batches and not p.get("numInputRows"):
+    def ext_onQueryProgress(self, event):
+        if event.get("id") and event.get("name"):
+            self._query_names.setdefault(event["id"], event["name"])
+
+        if self.progress_table is None:
+            return
+        if self.skip_empty_batches and not event.get("numInputRows"):
             return
 
-        sources = p.get("sources") or []
+        sources = event.get("sources") or []
         metric = lambda k: [_int((s.get("metrics") or {}).get(k)) for s in sources]
 
-        self._log(self.progress_table, PROGRESS_SCHEMA,
-            dict(
-                query_id            = p.get("id"),
-                query_name          = p.get("name"),
-                batch_id            = p.get("batchId"),
-                batch_timestamp     = _ts(p.get("timestamp")),
-                batch_duration      = p.get("batchDuration"),
-                duration_breakdown  = p.get("durationMs"),
-                input_rows          = p.get("numInputRows"),
-                sources             = [self._source_name(s) for s in sources],
-                files_outstanding   = metric("numFilesOutstanding"),
-                bytes_outstanding   = metric("numBytesOutstanding")
-            ))
+        # Built lazily on the writer thread, because _source_name may run a SQL query.
+        self._log(self.progress_table, PROGRESS_SCHEMA, lambda: dict(
+            query_id            = event.get("id"),
+            query_name          = event.get("name"),
+            batch_id            = event.get("batchId"),
+            batch_timestamp     = _ts(event.get("timestamp")),
+            batch_duration      = event.get("batchDuration"),
+            duration_breakdown  = event.get("durationMs"),
+            input_rows          = event.get("numInputRows"),
+            sources             = [self._source_name(s) for s in sources],
+            files_outstanding   = metric("numFilesOutstanding"),
+            bytes_outstanding   = metric("numBytesOutstanding")
+        ))
 
     def onQueryIdle(self, event):
         pass
-
