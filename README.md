@@ -4,5 +4,5 @@ Purpose of this repository is to create a collection of notebooks which explore 
 ## Using `dbx_utils` in a Databricks workspace
 
 ```python
-%pip install git+https://github.com/jawong3/Databricks_Demos_and_Utilities.git@v0.1.0
+%pip install git+https://github.com/jawong3/Databricks_Demos_and_Utilities.git@main
 ```
